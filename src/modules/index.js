@@ -146,3 +146,7 @@ export { KeyboardRoaming, RoamingController, RoamingPath } from './roaming'
 export { TrackViewMode, TrackController, Track } from './history-track'
 
 export { MeasureType, Measure } from './measure'
+
+export * from './third-part'
+
+export { getLib, registerLib } from '../global-api/lib-utils'
