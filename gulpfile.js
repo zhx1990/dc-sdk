@@ -9,20 +9,16 @@ import path from 'path'
 import gulp from 'gulp'
 import esbuild from 'esbuild'
 import concat from 'gulp-concat'
-import { rollup } from 'rollup'
 import clean from 'gulp-clean'
-import commonjs from '@rollup/plugin-commonjs'
-import resolve from '@rollup/plugin-node-resolve'
-import terser from '@rollup/plugin-terser'
-import scss from 'rollup-plugin-scss'
 import javascriptObfuscator from 'gulp-javascript-obfuscator'
-import { babel } from '@rollup/plugin-babel'
 import startServer from './server.js'
 import inlineImage from 'esbuild-plugin-inline-image'
+import { sassPlugin } from 'esbuild-sass-plugin'
 import { glsl } from 'esbuild-plugin-glsl'
-import chokidar from 'chokidar'
 import shell from 'shelljs'
 import chalk from 'chalk'
+
+const packageJson = fse.readJsonSync('./package.json')
 
 const obfuscatorConfig = {
   compact: true, //压缩代码
@@ -54,30 +50,9 @@ const buildConfig = {
       limit: -1,
     }),
     glsl(),
+    sassPlugin(),
   ],
 }
-
-const packageJson = fse.readJsonSync('./package.json')
-
-const plugins = [
-  resolve({ preferBuiltins: true }),
-  commonjs(),
-  babel({
-    babelHelpers: 'runtime',
-    presets: [
-      [
-        '@babel/preset-env',
-        {
-          modules: false,
-          targets: {
-            browsers: ['> 1%', 'last 2 versions', 'ie >= 10'],
-          },
-        },
-      ],
-    ],
-    plugins: ['@babel/plugin-transform-runtime'],
-  }),
-]
 
 function getTime() {
   let now = new Date()
@@ -89,44 +64,22 @@ function getTime() {
 }
 
 async function buildNamespace(options) {
-  const bundle = await rollup({
-    input: 'libs/index.js',
-    plugins: [...plugins, ...[options.dev ? null : terser()]],
-    onwarn: (message) => {
-      // Ignore eval warnings in third-party code we don't have control over
-      if (message.code === 'EVAL' && /protobufjs/.test(message.loc.file)) {
-        return
-      }
-      if (message.code === 'CIRCULAR_DEPENDENCY') {
-        return
-      }
-      console.log(message)
-    },
-  })
-  return bundle.write({
-    name: 'DC.__namespace',
-    file: options.node ? 'dist/namespace.cjs' : 'dist/namespace.js',
-    format: options.node ? 'cjs' : 'umd',
-    sourcemap: false,
-    banner: options.node ? '(function(){' : '',
-    footer: options.node ? '})()' : '',
+  await esbuild.build({
+    ...buildConfig,
+    entryPoints: ['libs/index.js'],
+    format: 'iife',
+    globalName: options.node ? 'ns' : 'DC.__namespace',
+    minify: options.minify,
+    outfile: path.join('dist', options.node ? 'namespace.cjs' : 'namespace.js'),
   })
 }
 
-async function buildCSS() {
-  const bundle = await rollup({
-    input: 'src/themes/index.js',
-    plugins: [
-      commonjs(),
-      resolve({ preferBuiltins: true }),
-      scss({
-        outputStyle: 'compressed',
-        fileName: 'dc.min.css',
-      }),
-    ],
-  })
-  return bundle.write({
-    file: 'dist/dc.min.css',
+async function buildCSS(options) {
+  await esbuild.build({
+    ...buildConfig,
+    minify: options.minify,
+    entryPoints: ['src/themes/index.scss'],
+    outfile: path.join('dist', 'dc.min.css'),
   })
 }
 
@@ -144,8 +97,8 @@ async function buildModules(options) {
     'utf8'
   )
 
-  const exportCmdOut = `
-        export function __cmdOut() {
+  const cmdOutFunction = `
+        function __cmdOut() {
           ${cmdOut_content
             .replace('{{__VERSION__}}', packageJson.version)
             .replace('{{__TIME__}}', getTime())
@@ -160,8 +113,8 @@ async function buildModules(options) {
 
   const exportNamespace = `
         export const __namespace = {
-            Cesium: exports.Cesium,
-            Supercluster: exports.Supercluster
+            Cesium: ns.Cesium,
+            Supercluster: ns.Supercluster
         }
      `
 
@@ -170,10 +123,9 @@ async function buildModules(options) {
     await fse.outputFile(
       dcPath,
       `
-              ${exportVersion}
-              ${exportCmdOut}
               ${content}
-
+              ${cmdOutFunction}
+              ${exportVersion}
             `,
       {
         encoding: 'utf8',
@@ -192,10 +144,10 @@ async function buildModules(options) {
     await fse.outputFile(
       dcPath,
       `
-            ${exportNamespace}
-            ${exportVersion}
-            ${exportCmdOut}
             ${content}
+            ${exportVersion}
+            ${exportNamespace}
+            ${cmdOutFunction}
             `,
       {
         encoding: 'utf8',
@@ -328,77 +280,81 @@ async function regenerate(option, content) {
   await fse.outputFile(path.join('dist', 'namespace.js'), content)
   await buildModules(option)
   await combineJs(option)
-  await buildCSS()
+  await buildCSS(option)
 }
 
 export const server = gulp.series(startServer)
 
 export const dev = gulp.series(
-  () => buildNamespace({ dev: true }),
+  () => buildNamespace({ iife: true }),
   copyAssets,
   () => {
     shell.echo(chalk.yellow('============= start dev =============='))
-    const watcher = chokidar.watch('src', {
+    let jsContent = null
+    const watcher = gulp.watch('src', {
       persistent: true,
       awaitWriteFinish: {
         stabilityThreshold: 1000,
         pollInterval: 100,
       },
     })
-    fse.readFile(path.join('dist', 'namespace.js'), 'utf8').then((content) => {
-      watcher
-        .on('ready', async () => {
-          await regenerate({ iife: true }, content)
-          await startServer()
-        })
-        .on('change', async () => {
-          let now = new Date()
-          await regenerate({ iife: true }, content)
-          shell.echo(
-            chalk.green(
-              `regenerate lib takes ${new Date().getTime() - now.getTime()} ms`
-            )
+    watcher
+      .on('ready', async () => {
+        jsContent = fse.readFileSync(path.join('dist', 'namespace.js'), 'utf8')
+        await regenerate({ iife: true }, jsContent)
+        await startServer()
+      })
+      .on('change', async () => {
+        let now = new Date().getTime()
+        if (!jsContent) {
+          jsContent = fse.readFileSync(
+            path.join('dist', 'namespace.js'),
+            'utf8'
           )
-        })
-    })
+        }
+        await regenerate({ iife: true }, jsContent)
+        shell.echo(
+          chalk.green(`regenerate lib takes ${new Date().getTime() - now} ms`)
+        )
+      })
     return watcher
   }
 )
 
 export const buildNode = gulp.series(
-  () => buildNamespace({ node: true }),
+  () => buildNamespace({ node: true, minify: true }),
   () => buildModules({ node: true }),
   () => combineJs({ node: true }),
-  buildCSS,
+  () => buildCSS({ minify: true }),
   copyAssets
 )
 
 export const buildIIFE = gulp.series(
-  () => buildNamespace({ iife: true }),
+  () => buildNamespace({ iife: true, minify: true }),
   () => buildModules({ iife: true }),
   () => combineJs({ iife: true }),
-  buildCSS,
+  () => buildCSS({ minify: true }),
   copyAssets
 )
 
 export const build = gulp.series(
-  () => buildNamespace({ node: true }),
+  () => buildNamespace({ node: true, minify: true }),
   () => buildModules({ node: true }),
   () => combineJs({ node: true }),
-  () => buildNamespace({ iife: true }),
+  () => buildNamespace({ iife: true, minify: true }),
   () => buildModules({ iife: true }),
   () => combineJs({ iife: true }),
-  buildCSS,
+  () => buildCSS({ minify: true }),
   copyAssets
 )
 
 export const buildRelease = gulp.series(
-  () => buildNamespace({ node: true }),
+  () => buildNamespace({ node: true, minify: true }),
   () => buildModules({ node: true }),
   () => combineJs({ node: true, obfuscate: true }),
-  () => buildNamespace({ iife: true }),
+  () => buildNamespace({ iife: true, minify: true }),
   () => buildModules({ iife: true }),
   () => combineJs({ iife: true, obfuscate: true }),
-  buildCSS,
+  () => buildCSS({ minify: true }),
   copyAssets
 )
